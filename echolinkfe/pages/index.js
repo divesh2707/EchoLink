@@ -323,7 +323,25 @@ export default function Home() {
       if (!peerConnectionsRef.current[remoteUser]) {
         try {
           const peerConnection = createPeerConnection(remoteUser);
+          const shouldCreateOffer = currentUserName < remoteUser;
+
+          if (!shouldCreateOffer) {
+            addMessage("Waiting for offer from " + remoteUser);
+            return;
+          }
+
+          if (peerConnection.signalingState !== "stable") {
+            addMessage("Skipped offer to " + remoteUser + " because signaling state is " + peerConnection.signalingState);
+            return;
+          }
+
           const offer = await peerConnection.createOffer();
+
+          if (peerConnection.signalingState !== "stable") {
+            addMessage("Skipped offer to " + remoteUser + " because incoming signaling started");
+            return;
+          }
+
           await peerConnection.setLocalDescription(offer);
 
           sendSignal({
