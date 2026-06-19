@@ -11,6 +11,8 @@ import com.example.EchoLink.redis.RedisMessagePublisher;
 import com.example.EchoLink.redis.RedisPresenceService;
 import com.example.EchoLink.room.RoomManager;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Component
 public class EchoWebSocketHandler extends TextWebSocketHandler {
@@ -21,6 +23,7 @@ public class EchoWebSocketHandler extends TextWebSocketHandler {
     private final RedisPresenceService redisPresenceService;
     private final RedisMessagePublisher redisMessagePublisher;
     private final ChannelTopic signalingTopic;
+    private final Map<String, String> roomByUsername = new ConcurrentHashMap<>();
 
     public EchoWebSocketHandler(RoomManager roomManager, ConnectionManager connectionManager, RedisPresenceService redisPresenceService, RedisMessagePublisher redisMessagePublisher, ChannelTopic signalingTopic) {
         this.roomManager = roomManager;
@@ -59,7 +62,7 @@ public class EchoWebSocketHandler extends TextWebSocketHandler {
         } else if("PRESENCE_UPDATE".equals(type)) {
             broadcastPresenceUpdate(payload, signalMessage);
         } else {
-            session.sendMessage(new TextMessage("{\type\":\"ERROR\",\"message\":\"Unknown message type\"}"));
+            session.sendMessage(new TextMessage("{\"type\":\"ERROR\",\"message\":\"Unknown message type\"}"));
         }
     }
 
@@ -68,12 +71,19 @@ public class EchoWebSocketHandler extends TextWebSocketHandler {
     private void handleJoinRoom(WebSocketSession session, SignalMessage signalMessage) throws Exception {
         String username = signalMessage.getUserName();
         String room = signalMessage.getRoom();
+        String previousRoom = roomByUsername.get(username);
+
+        if (previousRoom != null && !previousRoom.equals(room)) {
+            roomManager.leaveRoom(previousRoom, username);
+            broadcastRoomUsers(previousRoom, roomManager.listUsers(previousRoom));
+        }
 
         connectionManager.register(username, session);
         roomManager.joinRoom(room, username);
+        roomByUsername.put(username, room);
 
         List<String> users = roomManager.listUsers(room);
-        session.sendMessage(new TextMessage(objectMapper.writeValueAsString(users)));
+        broadcastRoomUsers(room, users);
 
         System.out.println(username + " joined room " + room);
         System.out.println("Current users in room " + room + ": " + users);
@@ -84,9 +94,10 @@ public class EchoWebSocketHandler extends TextWebSocketHandler {
         String room = signalMessage.getRoom();
 
         roomManager.leaveRoom(room, username);
+        roomByUsername.remove(username, room);
 
         List<String> users = roomManager.listUsers(room);
-        session.sendMessage(new TextMessage(objectMapper.writeValueAsString(users)));
+        broadcastRoomUsers(room, users);
 
         System.out.println(username + " left room " + room);
         System.out.println("Current users in room " + room + ": " + users);
@@ -99,6 +110,17 @@ public class EchoWebSocketHandler extends TextWebSocketHandler {
         session.sendMessage(new TextMessage(objectMapper.writeValueAsString(users)));
 
         System.out.println("Current users in room " + room + ": " + users);
+    }
+
+    private void broadcastRoomUsers(String room, List<String> users) throws Exception {
+        String usersPayload = objectMapper.writeValueAsString(users);
+
+        for (String username : users) {
+            WebSocketSession userSession = connectionManager.getSession(username);
+            if (userSession != null && userSession.isOpen()) {
+                userSession.sendMessage(new TextMessage(usersPayload));
+            }
+        }
     }
 
     private void forwardToTargetUser(WebSocketSession senderSession, String rawPayload, SignalMessage signalMessage) throws Exception {
@@ -146,6 +168,15 @@ public class EchoWebSocketHandler extends TextWebSocketHandler {
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
         String username = connectionManager.getUsernameBySessionId(session.getId());
         if (username != null) {
+            String room = roomByUsername.remove(username);
+            if (room != null) {
+                try {
+                    roomManager.leaveRoom(room, username);
+                    broadcastRoomUsers(room, roomManager.listUsers(room));
+                } catch (Exception exception) {
+                    exception.printStackTrace();
+                }
+            }
             redisPresenceService.markOffline(username);
         }
         connectionManager.remove(session);

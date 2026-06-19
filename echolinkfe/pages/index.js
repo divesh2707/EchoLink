@@ -7,6 +7,7 @@ export default function Home() {
   const remoteAudioRef = useRef(null);
   const localStreamRef = useRef(null);
   const peerConnectionsRef = useRef({});
+  const pendingIceCandidatesRef = useRef({});
   const speakingIntervalRef = useRef(null);
   const statsIntervalRef = useRef(null);
 
@@ -30,12 +31,40 @@ export default function Home() {
   const [candidateType, setCandidateType] = useState("unknown");
   const [roomUsers, setRoomUsers] = useState([]);
 
+  const userNameRef = useRef(userName);
+  const roomRef = useRef(room);
+  const mutedRef = useRef(muted);
+  const deafenedRef = useRef(deafened);
+  const speakingRef = useRef(speaking);
+
+  useEffect(() => {
+    userNameRef.current = userName;
+    roomRef.current = room;
+    mutedRef.current = muted;
+    deafenedRef.current = deafened;
+    speakingRef.current = speaking;
+  }, [userName, room, muted, deafened, speaking]);
+
   function addMessage(message) {
     setMessages(prevMessages => [...prevMessages, message]);
   }
 
+  function resolveWebSocketUrl(rawUrl) {
+    if (rawUrl.startsWith("ws://") || rawUrl.startsWith("wss://")) {
+      return rawUrl;
+    }
+
+    const path = rawUrl.startsWith("/") ? rawUrl : `/${rawUrl}`;
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${protocol}//${window.location.hostname}:8080${path}`;
+  }
+
   function connectWebSocket() {
-    const socket = new WebSocket("ws://192.168.1.7:8080/ws");
+    if (socketRef.current) {
+      socketRef.current.close();
+    }
+
+    const socket = new WebSocket(resolveWebSocketUrl(serverUrl.trim()));
 
     socket.onopen = () => {
       setConnected(true);
@@ -91,12 +120,23 @@ export default function Home() {
   }
 
   function joinRoom() {
+    const currentUserName = userName.trim();
+    const currentRoom = room.trim();
+
+    if (!currentUserName || !currentRoom) {
+      addMessage('Username and room are required');
+      return;
+    }
+
+    userNameRef.current = currentUserName;
+    roomRef.current = currentRoom;
+
     sendSignal({
       type: 'JOIN_ROOM',
-      userName,
-      room
+      userName: currentUserName,
+      room: currentRoom
     });
-    addMessage(userName + ' requested to join room: ' + room);
+    addMessage(currentUserName + ' requested to join room: ' + currentRoom);
   }
 
   function leaveRoom() {
@@ -112,10 +152,10 @@ export default function Home() {
 
     socketRef.current.send(JSON.stringify({
       type: 'LEAVE_ROOM',
-      userName,
-      room
+      userName: userNameRef.current,
+      room: roomRef.current
     }));
-    addMessage(userName + ' requested to leave room: ' + room);
+    addMessage(userNameRef.current + ' requested to leave room: ' + roomRef.current);
     
     // Clear out local peer states on leaving
     Object.keys(peerConnectionsRef.current).forEach((remoteUser) => {
@@ -123,6 +163,7 @@ export default function Home() {
       delete peerConnectionsRef.current[remoteUser];
       document.getElementById(`audio-${remoteUser}`)?.remove();
     });
+    pendingIceCandidatesRef.current = {};
     setRoomUsers([]);
   }
 
@@ -136,6 +177,9 @@ export default function Home() {
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      stream.getTracks().forEach(track => {
+        track.enabled = !mutedRef.current;
+      });
       localStreamRef.current = stream;
 
       if (localAudioRef.current) {
@@ -177,6 +221,7 @@ export default function Home() {
       delete peerConnectionsRef.current[remoteUser];
       document.getElementById(`audio-${remoteUser}`)?.remove();
     });
+    pendingIceCandidatesRef.current = {};
   }
 
   function createPeerConnection(remoteUsername) {
@@ -199,9 +244,9 @@ export default function Home() {
       if (event.candidate) {
         sendSignal({
           type: "ICE_CANDIDATE",
-          from: userName,
+          from: userNameRef.current,
           to: remoteUsername,
-          room,
+          room: roomRef.current,
           candidate: event.candidate,
         });
       }
@@ -220,7 +265,7 @@ export default function Home() {
       }
       
       audio.srcObject = event.streams[0];
-      audio.muted = deafened;
+      audio.muted = deafenedRef.current;
 
       audio.play()
         .then(() => addMessage("Audio started for " + remoteUsername))
@@ -269,7 +314,10 @@ export default function Home() {
 
     // Proactively establishing missing mesh connections
     roomUsers.forEach(async (remoteUser) => {
-      if (remoteUser === userName) return;
+      const currentUserName = userNameRef.current;
+      const currentRoom = roomRef.current;
+
+      if (remoteUser === currentUserName) return;
 
       // Ensure a structural connection context exists for every other participant
       if (!peerConnectionsRef.current[remoteUser]) {
@@ -280,9 +328,9 @@ export default function Home() {
 
           sendSignal({
             type: "WEBRTC_OFFER",
-            from: userName,
+            from: currentUserName,
             to: remoteUser,
-            room,
+            room: currentRoom,
             sdp: offer.sdp,
           });
           addMessage("Sent proactive offer to " + remoteUser);
@@ -291,7 +339,28 @@ export default function Home() {
         }
       }
     });
-  }, [roomUsers, microphoneEnabled, connected, userName, room]);
+  }, [roomUsers, microphoneEnabled, connected]);
+
+  function queueIceCandidate(remoteUsername, candidate) {
+    if (!pendingIceCandidatesRef.current[remoteUsername]) {
+      pendingIceCandidatesRef.current[remoteUsername] = [];
+    }
+
+    pendingIceCandidatesRef.current[remoteUsername].push(candidate);
+  }
+
+  async function flushQueuedIceCandidates(remoteUsername, peerConnection) {
+    if (!peerConnection.remoteDescription) {
+      return;
+    }
+
+    const pendingCandidates = pendingIceCandidatesRef.current[remoteUsername] || [];
+    delete pendingIceCandidatesRef.current[remoteUsername];
+
+    for (const candidate of pendingCandidates) {
+      await peerConnection.addIceCandidate(candidate);
+    }
+  }
 
   async function handleOffer(message) {
     if (!localStreamRef.current) {
@@ -306,7 +375,9 @@ export default function Home() {
       }
 
       // Perfect Negotiation implementation tie-breaking rule
-      const isPolite = userName > message.from; 
+      const currentUserName = userNameRef.current;
+      const currentRoom = roomRef.current;
+      const isPolite = currentUserName > message.from;
       const glareCollision = peerConnection.signalingState !== "stable";
 
       if (glareCollision) {
@@ -328,14 +399,16 @@ export default function Home() {
         });
       }
 
+      await flushQueuedIceCandidates(message.from, peerConnection);
+
       const answer = await peerConnection.createAnswer();
       await peerConnection.setLocalDescription(answer);
 
       sendSignal({
         type: "WEBRTC_ANSWER",
-        from: userName,
+        from: currentUserName,
         to: message.from,
-        room,
+        room: currentRoom,
         sdp: answer.sdp,
       });
 
@@ -363,6 +436,7 @@ export default function Home() {
         type: "answer",
         sdp: message.sdp,
       });
+      await flushQueuedIceCandidates(message.from, peerConnection);
 
       addMessage("Received and set answer from " + message.from);
     } catch (error) {
@@ -374,11 +448,18 @@ export default function Home() {
   async function handleICECandidate(message) {
     const peerConnection = peerConnectionsRef.current[message.from];
     if (!peerConnection) {
-      addMessage("No peer connection found for ICE from " + message.from);
+      queueIceCandidate(message.from, message.candidate);
+      addMessage("Queued ICE candidate until peer connection exists for " + message.from);
       return;
     }
 
     try {
+      if (!peerConnection.remoteDescription) {
+        queueIceCandidate(message.from, message.candidate);
+        addMessage("Queued ICE candidate until remote description is set for " + message.from);
+        return;
+      }
+
       await peerConnection.addIceCandidate(message.candidate);
     } catch (error) {
       addMessage("Error adding ICE candidate from " + message.from + ": " + error.message);
@@ -389,8 +470,8 @@ export default function Home() {
   function sendPresenceUpdate(nextMuted, nextDeafened, nextSpeaking) {
     sendSignal({
       type: 'PRESENCE_UPDATE',
-      userName,
-      room,
+      userName: userNameRef.current,
+      room: roomRef.current,
       muted: nextMuted,
       deafened: nextDeafened,
       speaking: nextSpeaking,
@@ -420,7 +501,7 @@ export default function Home() {
       if (isSpeaking !== lastSpeakingState) {
         lastSpeakingState = isSpeaking;
         setSpeaking(isSpeaking);
-        sendPresenceUpdate(muted, deafened, isSpeaking);
+        sendPresenceUpdate(mutedRef.current, deafenedRef.current, isSpeaking);
         addMessage("Speaking changed: " + isSpeaking);
       }
     }, 300);
@@ -519,25 +600,27 @@ export default function Home() {
           <button onClick={() => {
             const nextMuted = !muted;
             setMuted(nextMuted);
+            mutedRef.current = nextMuted;
             if (localStreamRef.current) {
               localStreamRef.current.getTracks().forEach(track => {
                 track.enabled = !nextMuted;
               });
             }
-            sendPresenceUpdate(nextMuted, deafened, speaking);
+            sendPresenceUpdate(nextMuted, deafenedRef.current, speakingRef.current);
           }}>
             {muted ? 'Unmute' : 'Mute'}
           </button>
           <button onClick={() => {
             const nextDeafened = !deafened;
             setDeafened(nextDeafened);
+            deafenedRef.current = nextDeafened;
             
             roomUsers.forEach((user) => {
               const audioElem = document.getElementById(`audio-${user}`);
               if (audioElem) audioElem.muted = nextDeafened;
             });
             
-            sendPresenceUpdate(muted, nextDeafened, speaking);
+            sendPresenceUpdate(mutedRef.current, nextDeafened, speakingRef.current);
           }}>
             {deafened ? 'Undeafen' : 'Deafen'}
           </button>
