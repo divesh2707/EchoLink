@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: echolink-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - echolink_postgres_data:/var/lib/postgresql/data
+  redis:
+    image: redis:7
+    container_name: echolink-redis
+    ports:
+      - "6379:6379"
+
+  coturn:
+    image: coturn/coturn
+    container_name: echolink-coturn
+    ports:
+    - "3478:3478"
+    - "3478:3478/udp"
+    command: 
+      - -n
+      - --log-file=stdout
+      - --lt-cred-mech
+      - --user=echolink:echolink123
+      - --realm=echolink.local
+      - --fingerprint
+      - --no-multicast-peers
+      - --no-cli
+    
+volumes:
+  echolink_postgres_data:
